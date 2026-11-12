@@ -9,6 +9,16 @@ using namespace kittens;
 #include "utils.cpp"
 
 #define SIZE 8192
+// Problem size can be set per build: make EXTRA_HIPFLAGS+="-DGM=8192 -DGN=16384 -DGK=5376" (M, N must divide by 256).
+#ifndef GM
+#define GM SIZE
+#endif
+#ifndef GN
+#define GN SIZE
+#endif
+#ifndef GK
+#define GK SIZE
+#endif
 
 constexpr int NUM_WARPS = 4;
 
@@ -993,9 +1003,9 @@ TimingResult matmul_host(std::vector<fp8e4m3>& a, std::vector<fp8e4m3>& b, std::
 
 int main() {
     // Reduced problem size for faster timing
-    constexpr int M = SIZE;  // 256 threadblocks needed for 2048x2048
-    constexpr int N = SIZE;  
-    constexpr int K = SIZE;  // Smaller K for reasonable timing
+    constexpr int M = GM;
+    constexpr int N = GN;
+    constexpr int K = GK;
     constexpr int CUs = 256; // 256 threadblocks (1 outer iteration)
     
     // Timing parameters to keep total runtime reasonable  
