@@ -193,7 +193,18 @@ __global__ void attend_ker_d512(const attn_globals g) {
     const int my_kv_tiles = (q_pos0 + Q_BLOCK_SIZE + KV_BLOCK_SIZE - 1) / KV_BLOCK_SIZE;
 
     // ---- Q: 4 chunks of 32 x 128, pre-scaled by softmax_scale * log2(e), kept transposed in registers ----
-#ifndef Q_STREAM
+#if defined(QK_ABT)   // Q kept row-major: S^T = K Q^T via mma_ABt, no register transposes of Q or K
+    qo_tile<bf16> q_r[NC];
+    if (warp_active) {
+        #pragma unroll
+        for (int c = 0; c < NC; c++) {
+            qo_tile<float> q_fl;
+            load<1, qo_tile<float>, _gl_QKVO>(q_fl, g.Qg, {batch_idx, tile_idx, head_idx, c});
+            mul(q_fl, q_fl, ATTN_SCALE * 1.44269504089f);
+            copy(q_r[c], q_fl);
+        }
+    }
+#elif !defined(Q_STREAM)
     qo_tile_transposed<bf16> q_t[NC];
     if (warp_active) {
         #pragma unroll
@@ -305,11 +316,32 @@ __global__ void attend_ker_d512(const attn_globals g) {
 
         // S^T = K_j Q^T over 4 head_dim chunks
         zero(att);
+#ifdef PIPE_LDS   // software-pipelined LDS reads: chunk c+1 is read while chunk c's MFMAs run (needs QK_ABT)
+        static_assert(NC >= 2, "PIPE_LDS needs at least two head_dim chunks");
+        {
+            kv_tile<bf16> kr[2];
+            load(kr[0], k_smem[cur]);
+            __builtin_amdgcn_sched_barrier(0); asm volatile("s_waitcnt lgkmcnt(0)"); __builtin_amdgcn_sched_barrier(0);
+            #pragma unroll
+            for (int c = 0; c < NC; c++) {
+                if (c + 1 < NC) load(kr[(c + 1) & 1], k_smem[cur + c + 1]);
+                mma_ABt(att, kr[c & 1], q_r[c], att);
+                __builtin_amdgcn_sched_barrier(0); asm volatile("s_waitcnt lgkmcnt(0)"); __builtin_amdgcn_sched_barrier(0);
+            }
+        }
+        kv_tile<bf16, col_l, rt_16x32_4_s> vr[2];
+#ifdef PIPE_V_EARLY
+        load(vr[0], v_smem[cur]);   // first V chunk read during the mask and softmax below
+#endif
+#else
         #pragma unroll
         for (int c = 0; c < NC; c++) {
             kv_tile<bf16> k_reg;
             load(k_reg, k_smem[cur + c]);
             __builtin_amdgcn_sched_barrier(0); asm volatile("s_waitcnt lgkmcnt(0)"); __builtin_amdgcn_sched_barrier(0);
+#ifdef QK_ABT
+            mma_ABt(att, k_reg, q_r[c], att);
+#else
             kv_tile_transposed<bf16> k_t;
             transpose(k_t, k_reg);
 #ifdef Q_STREAM   // Q chunk re-read from global (L1/L2) per KV tile: frees 128 VGPRs, scale applied to S below
@@ -324,7 +356,9 @@ __global__ void attend_ker_d512(const attn_globals g) {
             mma_AtB(att, k_t, q_t[c], att);
 #endif
 #endif
+#endif   // QK_ABT
         }
+#endif   // PIPE_LDS
 #ifdef Q_STREAM
         mul(att, att, ATTN_SCALE * 1.44269504089f);
 #endif
@@ -402,6 +436,18 @@ __global__ void attend_ker_d512(const attn_globals g) {
         att_in = *reinterpret_cast<attn_tile<bf16, col_l, rt_16x32_4_s>*>(&att_bf16);
 
         // O_c^T = O_c^T * scale + V_c^T P^T
+#ifdef PIPE_LDS
+#ifndef PIPE_V_EARLY
+        load(vr[0], v_smem[cur]);
+#endif
+        __builtin_amdgcn_sched_barrier(0); asm volatile("s_waitcnt lgkmcnt(0)"); __builtin_amdgcn_sched_barrier(0);
+        #pragma unroll
+        for (int c = 0; c < NC; c++) {
+            if (c + 1 < NC) load(vr[(c + 1) & 1], v_smem[cur + c + 1]);
+            mma_AtB(o[c], vr[c & 1], att_in, o[c]);
+            __builtin_amdgcn_sched_barrier(0); asm volatile("s_waitcnt lgkmcnt(0)"); __builtin_amdgcn_sched_barrier(0);
+        }
+#else
         #pragma unroll
         for (int c = 0; c < NC; c++) {
 #if !defined(DEBUG_NORESCALE) && !defined(LAZY_RESCALE)
@@ -416,6 +462,7 @@ __global__ void attend_ker_d512(const attn_globals g) {
 #endif
 #endif
         }
+#endif   // PIPE_LDS
     }
 
     if (!warp_active) return;
