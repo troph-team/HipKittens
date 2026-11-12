@@ -440,12 +440,16 @@ __global__ void attend_ker_d512(const attn_globals g) {
 #ifndef PIPE_V_EARLY
         load(vr[0], v_smem[cur]);
 #endif
+#ifndef KITTENS_LDS_TR_BUILTIN
         __builtin_amdgcn_sched_barrier(0); asm volatile("s_waitcnt lgkmcnt(0)"); __builtin_amdgcn_sched_barrier(0);
+#endif
         #pragma unroll
         for (int c = 0; c < NC; c++) {
             if (c + 1 < NC) load(vr[(c + 1) & 1], v_smem[cur + c + 1]);
             mma_AtB(o[c], vr[c & 1], att_in, o[c]);
+#ifndef KITTENS_LDS_TR_BUILTIN   // builtin reads are compiler-tracked: no manual wait
             __builtin_amdgcn_sched_barrier(0); asm volatile("s_waitcnt lgkmcnt(0)"); __builtin_amdgcn_sched_barrier(0);
+#endif
         }
 #else
         #pragma unroll
@@ -456,7 +460,9 @@ __global__ void attend_ker_d512(const attn_globals g) {
 #ifndef DEBUG_NOPV   // timing probe: no V LDS read, no PV MFMA
             kv_tile<bf16, col_l, rt_16x32_4_s> v_reg;
             load(v_reg, v_smem[cur + c]);
+#ifndef KITTENS_LDS_TR_BUILTIN
             __builtin_amdgcn_sched_barrier(0); asm volatile("s_waitcnt lgkmcnt(0)"); __builtin_amdgcn_sched_barrier(0);
+#endif
 #ifndef DEBUG_NOPV_MMA   // timing probe: V read from LDS, no PV MFMA
             mma_AtB(o[c], v_reg, att_in, o[c]);
 #endif

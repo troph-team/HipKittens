@@ -7,6 +7,10 @@
 
 #include <type_traits>
 
+#ifdef KITTENS_LDS_TR_BUILTIN
+typedef short kittens_v4i16 __attribute__((ext_vector_type(4)));
+#endif
+
 #include "../../../../common/common.cuh"
 #include "../../../../types/types.cuh"
 #include "../util/util.cuh"
@@ -266,6 +270,10 @@ __device__ inline static void load(RT &dst, const ST &src) {
                                     );
                                 // Use one ds_read_b64_tr_b16 for stride == 4, dtype == bf16
                                 } else if constexpr (RT::base_tile_stride == 4) {
+                                    #ifdef KITTENS_LDS_TR_BUILTIN   // compiler-tracked transposing read: the compiler places the waits itself
+                                    *reinterpret_cast<kittens_v4i16*>(&dst.tiles[register_row][register_col].data[idx]) = __builtin_amdgcn_ds_read_tr16_b64_v4i16(
+                                        (__attribute__((address_space(3))) kittens_v4i16*)(uintptr_t)(addr + offset));
+                                    #else
                                     asm volatile(
                                         "ds_read_b64_tr_b16 %0, %1 offset:%2\n"
                                         // "s_waitcnt lgkmcnt(0)\n"
@@ -273,6 +281,7 @@ __device__ inline static void load(RT &dst, const ST &src) {
                                         : "v"(addr), "i"(offset)
                                         : "memory"
                                     );
+                                    #endif
                                 } else {
                                     static_assert(false, "Unsupported stride");
                                 }
@@ -337,12 +346,17 @@ __device__ inline static void load(RT &dst, const ST &src) {
                                     );
                                 // Use one ds_read_b64_tr_b16 for stride == 4, dtype == bf16
                                 } else if constexpr (RT::base_tile_stride == 4) {
+                                    #ifdef KITTENS_LDS_TR_BUILTIN   // compiler-tracked transposing read: the compiler places the waits itself
+                                    *reinterpret_cast<kittens_v4i16*>(&dst.tiles[i][j].data[idx]) = __builtin_amdgcn_ds_read_tr16_b64_v4i16(
+                                        (__attribute__((address_space(3))) kittens_v4i16*)(uintptr_t)(addr + offset));
+                                    #else
                                     asm volatile(
                                         "ds_read_b64_tr_b16 %0, %1 offset:%2\n"
                                         : "=v"(*reinterpret_cast<float2*>(&dst.tiles[i][j].data[idx]))
                                         : "v"(addr), "i"(offset)
                                         : "memory"
                                     );
+                                    #endif
                                 } else {
                                     static_assert(false, "Unsupported stride");
                                 }
@@ -393,12 +407,17 @@ __device__ inline static void load(RT &dst, const ST &src) {
                                 );
                             // Use one ds_read_b64_tr_b16 for stride == 4, dtype == bf16
                             } else if constexpr (RT::base_tile_stride == 4) {
+                                #ifdef KITTENS_LDS_TR_BUILTIN   // compiler-tracked transposing read: the compiler places the waits itself
+                                *reinterpret_cast<kittens_v4i16*>(&dst.tiles[i][j].data[idx]) = __builtin_amdgcn_ds_read_tr16_b64_v4i16(
+                                    (__attribute__((address_space(3))) kittens_v4i16*)(uintptr_t)(addr + offset));
+                                #else
                                 asm volatile(
                                     "ds_read_b64_tr_b16 %0, %1 offset:%2\n"
                                     : "=v"(*reinterpret_cast<float2*>(&dst.tiles[i][j].data[idx]))
                                     : "v"(addr), "i"(offset)
                                     : "memory"
                                 );
+                                #endif
                             } else {
                                 static_assert(false, "Unsupported stride");
                             }
