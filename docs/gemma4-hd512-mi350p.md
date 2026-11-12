@@ -144,3 +144,59 @@ Bugs found on the way:
 
 Next: remove the 126 spilled VGPRs (e.g. stream Q chunks instead of holding all 4 in registers), double-buffer K/V,
 then interleave MFMA with softmax as `gqa_causal` does. After that, a prefix + extend entry point for SGLang.
+
+## v2 (lazy rescale, 64-wide chunks): 129 → 99 ms at P = 64K, E = 8K
+
+Build: `-DDIRECT_LDS -DDOUBLE_BUF -DKV_BLOCK=32 -DDC_SIZE=64 -DLAZY_RESCALE -DQK_ABT -DATTN_SCALE=1.0f`, 4 warps.
+
+**Timing probes**, each removing one part (memory loads removed in all rows but the first two):
+
+| removed | v1 | v2 |
+|---|---|---|
+| nothing (memory on) | 129.3 ms | 99.4 ms |
+| global K/V loads | 102.8 | 98.7 |
+| V LDS read + P·V MFMA | 47.2 | 50.6 |
+| P·V MFMA only | 59.9 | 67.1 |
+| QK MFMA only | 87.3 | 84.5 |
+| both MFMAs | 51.6 | 61.1 |
+| the O rescale | 78.8 | (lazy) |
+
+- **Lazy rescale** keeps a stale running max unless a query's max grows by more than 2^8 (warp ballot). It is exact.
+- **DC = 64** removes the 14–24 VGPR spill.
+- **What's left:**
+  - Memory is gone as a cost.
+  - About 61 ms is LDS reads, softmax and barriers that never overlap the ~38 ms of MFMA, because there is one
+    wave per SIMD.
+  - Pipelining the LDS reads inside a wave gives ≤ 2%. That figure is with `KITTENS_LDS_TR_BUILTIN`: the inline-asm
+    reads are invisible to the compiler, which moved registers whose reads were still in flight.
+
+**In SGLang** (FP8-dynamic, 64K cached + 32K new): this kernel is still 58% of all GPU time in the prefill (4.86 of
+8.45 s, 50 calls). FP8 GEMMs are about 18% and sliding-window attention 6%.
+
+**Stale-LDS NaN.** When `n_kv` is not a multiple of KV_BLOCK, the rows past the end of the buffer are never written
+into LDS. The last block then holds whatever an earlier kernel left there, and P = 0 times a stale NaN is NaN. The
+SGLang wrapper pads K/V to whole blocks. A kernel-side fix would zero those LDS rows, or zero V in registers past
+`n_kv`.
+
+## Next: two waves per SIMD (warp pairs split head_dim)
+
+O at 32 queries × 512 is 256 fp32 registers, so a second wave per SIMD cannot fit unless head_dim is split. The plan:
+
+- **Warps:** 8 per block, as 4 query tiles × 2 head_dim halves. Each wave holds Q[32×256] bf16 (64 VGPRs) and
+  O[256×32] fp32 (128 AGPRs), within a 256-register budget.
+- **Per KV tile:**
+  1. Each wave computes a partial Sᵀ over its 256 dims.
+  2. The pair swaps partials through LDS (4 KB per warp) and adds them.
+  3. Both run the same softmax, so the lazy-rescale decision is identical.
+  4. Each wave does P·V on its own V half.
+- **LDS reads per tile** are unchanged in total (each wave reads half of K and half of V). The gain is that one
+  wave's LDS reads and softmax can run under the other wave's MFMAs; `s_setprio` ping-pong as in the D=128 kernel.
+- **Upper bound:** max(61, 38) ms plus the swap, against 99 ms now.
+
+**Considered and set aside:**
+- **K rebuilt from V.** Gemma 4's global layers have `attention_k_eq_v`, with partial rotary 0.25. So the 384
+  un-rotated K dims are exactly `k_norm.weight ⊙ V`, and folding the weight into Q would let the kernel load only
+  K_rot (128 dims) plus V. That cuts K/V memory traffic 37.5%, but QK still needs V read in a second register
+  layout, so LDS read traffic doesn't drop, and memory is no longer the limit.
+- **FP8 P·V.** HipKittens' FP8 register tiles cover only the 16×16×128 MFMA, which needs 128-row KV blocks and
+  doesn't fit in LDS. The 32×32×64 form would need raw MFMA calls and a custom V layout.
