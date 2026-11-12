@@ -12,7 +12,7 @@ k = torch.randn(1, N, HKV, D, device="cuda", dtype=torch.bfloat16)
 v = torch.randn(1, N, HKV, D, device="cuda", dtype=torch.bfloat16)
 o = torch.zeros(1, N, H, D, device="cuda", dtype=torch.bfloat16)
 lse = torch.zeros(1, H, 1, N, device="cuda", dtype=torch.float32)
-run = lambda: tk_kernel.dispatch_d512(q, k, v, o, lse)
+run = lambda: tk_kernel.dispatch_d512(q, k, v, o, lse, 0, N, N)
 run(); torch.cuda.synchronize()
 # fp32 reference, a slice of heads to keep memory bounded
 errs = []

@@ -5,7 +5,7 @@ torch.manual_seed(0)
 q = torch.randn(1, N, H, D, device="cuda", dtype=torch.bfloat16); k = torch.randn(1, N, HKV, D, device="cuda", dtype=torch.bfloat16)
 v = torch.randn(1, N, HKV, D, device="cuda", dtype=torch.bfloat16)
 o = torch.zeros(1, N, H, D, device="cuda", dtype=torch.bfloat16); lse = torch.zeros(1, H, 1, N, device="cuda")
-tk_kernel.dispatch_d512(q, k, v, o, lse); torch.cuda.synchronize()
+tk_kernel.dispatch_d512(q, k, v, o, lse, 0, N, N); torch.cuda.synchronize()
 h = 0
 S = (q[0, :, h].float() * sc) @ k[0, :64, h // g].float().t()   # (N q, 64 kv)
 got = o[0, :, h, :64].float()

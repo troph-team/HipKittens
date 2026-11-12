@@ -74,9 +74,9 @@ __device__ inline void mask_vec2_imm(uint32_t rel_vgpr, uint32_t neg_inf_vgpr, u
 }
 
 template<ducks::rt::col_layout RT>
-__device__ inline void mask_kv_tile(RT &dst, int q_abs, int k_abs, uint32_t neg_inf_v, int lane) {
+__device__ inline void mask_kv_tile(RT &dst, int q_base_pos, int k_abs, uint32_t neg_inf_v, int lane) {
     const int col = lane & 31;
-    const int q_pos = q_abs * Q_BLOCK_SIZE + col;
+    const int q_pos = q_base_pos + col;   // absolute position of this lane's query (prefix offset included)
     const int k_base = k_abs * KV_BLOCK_SIZE;
     #pragma unroll
     for (int i = 0; i < dst.height; ++i) {
@@ -114,9 +114,12 @@ __device__ inline void mask_kv_tile(RT &dst, int q_abs, int k_abs, uint32_t neg_
 
 struct attn_globals {
     _gl_QKVO Qg, Kg, Vg, Og;          // (B, N, H, D) and (B, N, H_KV, D), bf16
-    gl<float, -1, -1, -1, -1> L_vec;   // (B, H, 1, N) natural-log LSE
+    gl<float, -1, -1, -1, -1> L_vec;   // (B, H, 1, n_q) natural-log LSE
+    // prefix + extend: queries are positions q_off .. q_off + n_q - 1 of a sequence whose K/V hold n_kv rows
+    // (n_kv = q_off + n_q for one extend chunk over a cached prefix; q_off = 0, n_kv = n_q is plain causal attention)
+    int q_off, n_q, n_kv;
     hipStream_t stream;
-    dim3 grid() { return dim3(ATTN_H, (ATTN_N / Q_BLOCK_SIZE + NUM_WARPS - 1) / NUM_WARPS, ATTN_B); }
+    dim3 grid() { return dim3(ATTN_H, ((n_q + Q_BLOCK_SIZE - 1) / Q_BLOCK_SIZE + NUM_WARPS - 1) / NUM_WARPS, ATTN_B); }
     dim3 block() { return dim3(NUM_THREADS); }
     size_t dynamic_shared_memory() { return MAX_SHARED_MEMORY; }
 };
@@ -147,7 +150,8 @@ __global__ void attend_ker_d512(const attn_globals g) {
                (unsigned)sizeof(k_smem[0]), (unsigned)sizeof(v_smem[0]));
 #endif
     const int q_start_pos = tile_idx * Q_BLOCK_SIZE;
-    const bool warp_active = q_start_pos < ATTN_N;
+    const bool warp_active = q_start_pos < g.n_q;
+    const int q_pos0 = g.q_off + q_start_pos;   // absolute position of this warp's first query
     const uint32_t neg_inf_v = 0xff800000;
 
     // K/V staging exactly as gqa_causal/kernel.cpp: direct-to-LDS buffer loads with precomputed swizzled offsets
@@ -155,8 +159,8 @@ __global__ void attend_ker_d512(const attn_globals g) {
     const bf16* v_base = (bf16*)&g.Vg[{batch_idx, 0, head_idx_kv, 0}];
     const int k_row_stride = g.Kg.template stride<1>() * sizeof(bf16);
     const int v_row_stride = g.Vg.template stride<1>() * sizeof(bf16);
-    i32x4 k_srsrc = make_srsrc(k_base, k_row_stride * ATTN_N, k_row_stride);
-    i32x4 v_srsrc = make_srsrc(v_base, v_row_stride * ATTN_N, v_row_stride);
+    i32x4 k_srsrc = make_srsrc(k_base, k_row_stride * g.n_kv, k_row_stride);   // rows past n_kv read as 0 (then masked)
+    i32x4 v_srsrc = make_srsrc(v_base, v_row_stride * g.n_kv, v_row_stride);
     const int wid = warpid() % NUM_WARPS;
     constexpr int elem_per_warp = (16 / sizeof(bf16)) * kittens::WARP_THREADS;
     uint32_t k_lds[NBUF * NC], v_lds[NBUF * NC];
@@ -175,10 +179,10 @@ __global__ void attend_ker_d512(const attn_globals g) {
     G::prefill_swizzled_offsets<1, false>(v_smem[0], g.Vg, swz_V);
 
     // KV tiles this block needs (causal): up to the last query of its last warp
-    const int last_q = min((block_tile_idx + 1) * NUM_WARPS * Q_BLOCK_SIZE, ATTN_N);
-    const int num_kv_tiles = (last_q + KV_BLOCK_SIZE - 1) / KV_BLOCK_SIZE;
+    const int last_q = g.q_off + min((block_tile_idx + 1) * NUM_WARPS * Q_BLOCK_SIZE, g.n_q);
+    const int num_kv_tiles = min((last_q + KV_BLOCK_SIZE - 1) / KV_BLOCK_SIZE, (g.n_kv + KV_BLOCK_SIZE - 1) / KV_BLOCK_SIZE);
     // KV tiles this warp needs
-    const int my_kv_tiles = (q_start_pos + Q_BLOCK_SIZE + KV_BLOCK_SIZE - 1) / KV_BLOCK_SIZE;
+    const int my_kv_tiles = (q_pos0 + Q_BLOCK_SIZE + KV_BLOCK_SIZE - 1) / KV_BLOCK_SIZE;
 
     // ---- Q: 4 chunks of 32 x 128, pre-scaled by softmax_scale * log2(e), kept transposed in registers ----
 #ifndef Q_STREAM
@@ -323,7 +327,7 @@ __global__ void attend_ker_d512(const attn_globals g) {
         }
 #endif
 #ifndef DEBUG_NOMASK
-        if ((j + 1) * KV_BLOCK_SIZE > q_start_pos) mask_kv_tile(att, tile_idx, j, neg_inf_v, lane);
+        if ((j + 1) * KV_BLOCK_SIZE > q_pos0) mask_kv_tile(att, q_pos0, j, neg_inf_v, lane);
 #endif
 
 #ifdef DEBUG_PV
@@ -394,6 +398,8 @@ void dispatch_d512(attn_globals g) {
 
 PYBIND11_MODULE(tk_kernel, m) {
     m.doc() = "HipKittens GQA causal attention, head_dim 512 (v0)";
+    // dispatch_d512(q (B,n_q,H,D), k (B,n_kv,H_KV,D), v, o (B,n_q,H,D), lse (B,H,1,n_q), q_off, n_q, n_kv)
     py::bind_function<dispatch_d512>(m, "dispatch_d512",
-        &attn_globals::Qg, &attn_globals::Kg, &attn_globals::Vg, &attn_globals::Og, &attn_globals::L_vec);
+        &attn_globals::Qg, &attn_globals::Kg, &attn_globals::Vg, &attn_globals::Og, &attn_globals::L_vec,
+        &attn_globals::q_off, &attn_globals::n_q, &attn_globals::n_kv);
 }

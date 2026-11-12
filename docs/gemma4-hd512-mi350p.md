@@ -92,6 +92,22 @@ Optimizations so far (D=512, N=16384; build flags in parentheses):
 | KV block 32 (`-DKV_BLOCK=32`) | 10 | 27.8 ms | 316 | 1.10× |
 | + direct-to-LDS, double-buffered K/V (`-DDIRECT_LDS -DDOUBLE_BUF -DKV_BLOCK=32`) | 15 | 26.8 ms | 329 | 1.14× |
 
+**Prefix + extend** (runtime `q_off`, `n_q`, `n_kv`; `test_extend.py`; `-DATTN_SCALE=1.0f` for Gemma 4).
+- Correct vs fp32: 2.8e-3 at P=2048 / E=512, and 2.9e-3 at P=32000 / E=1024, a prefix that isn't a multiple of the KV
+  block.
+- At Gemma's replay shape (P=65536 cached + E=8192 new):
+
+| kernel | time | TFLOP/s | rel err vs fp32 |
+|---|---|---|---|
+| **HipKittens d512, bf16 prefix** | **129.5 ms** | **289** | **0.28%** |
+| SGLang Triton extend, bf16 prefix | 184.2 ms | 203 | |
+| SGLang Triton extend, FP8 prefix + hd512 tile (server today, from amd-inference-eval worklog 16) | 131 ms | | 11.2% |
+| SGLang Triton extend, FP8 prefix + tile + `SGLANG_FP8_PREFIX_PRECISE` | 144 ms | | 0.35% |
+
+So HipKittens is 1.42× Triton at equal precision (bf16 prefix). Against the server's FP8 path it matches the fast
+variant's speed at 40× its accuracy, and beats the accurate variant by 1.11×. Feeding it from SGLang's paged FP8
+cache means gathering and upcasting the prefix to bf16 per layer, ~0.4 GB of traffic or well under 1 ms.
+
 Tried and rejected: streaming Q chunks from global per KV tile (`-DQ_STREAM`). It removes all spills but is slower
 (39.8 ms), because the per-chunk waits expose latency.
 

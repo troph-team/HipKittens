@@ -5,7 +5,7 @@ torch.manual_seed(0)
 q = torch.randn(1, N, H, D, device="cuda", dtype=torch.bfloat16); k = torch.randn(1, N, HKV, D, device="cuda", dtype=torch.bfloat16)
 v = torch.randn(1, N, HKV, D, device="cuda", dtype=torch.bfloat16)
 o = torch.full((1, N, H, D), 7.0, device="cuda", dtype=torch.bfloat16); lse = torch.zeros(1, H, 1, N, device="cuda")
-tk_kernel.dispatch_d512(q, k, v, o, lse); torch.cuda.synchronize()
+tk_kernel.dispatch_d512(q, k, v, o, lse, 0, N, N); torch.cuda.synchronize()
 for h in (0, 1, 8):
     s = (q[0, :, h].float() @ k[0, :, h // g].float().t()) * scale
     s.masked_fill_(torch.ones(N, N, dtype=torch.bool, device="cuda").triu(1), float("-inf"))
