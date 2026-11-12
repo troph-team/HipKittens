@@ -33,9 +33,12 @@ constexpr int Q_BLOCK_SIZE = 32;
 #define KV_BLOCK 64
 #endif
 constexpr int KV_BLOCK_SIZE = KV_BLOCK;
-constexpr int DC = 128;              // head_dim chunk
+#ifndef DC_SIZE
+#define DC_SIZE 128
+#endif
+constexpr int DC = DC_SIZE;          // head_dim chunk (64 halves the K working registers)
 constexpr int NC = ATTN_D / DC;      // number of chunks
-static_assert(ATTN_D % DC == 0, "head_dim must be a multiple of 128");
+static_assert(ATTN_D % DC == 0, "head_dim must be a multiple of the chunk");
 
 #ifndef NUM_WARPS
 #define NUM_WARPS 4
@@ -159,8 +162,13 @@ __global__ void attend_ker_d512(const attn_globals g) {
     const bf16* v_base = (bf16*)&g.Vg[{batch_idx, 0, head_idx_kv, 0}];
     const int k_row_stride = g.Kg.template stride<1>() * sizeof(bf16);
     const int v_row_stride = g.Vg.template stride<1>() * sizeof(bf16);
+#ifdef DEBUG_NOMEM   // timing probe: every K/V load is out of range (returns 0 without touching memory)
+    i32x4 k_srsrc = make_srsrc(k_base, 0, k_row_stride);
+    i32x4 v_srsrc = make_srsrc(v_base, 0, v_row_stride);
+#else
     i32x4 k_srsrc = make_srsrc(k_base, k_row_stride * g.n_kv, k_row_stride);   // rows past n_kv read as 0 (then masked)
     i32x4 v_srsrc = make_srsrc(v_base, v_row_stride * g.n_kv, v_row_stride);
+#endif
     const int wid = warpid() % NUM_WARPS;
     constexpr int elem_per_warp = (16 / sizeof(bf16)) * kittens::WARP_THREADS;
     uint32_t k_lds[NBUF * NC], v_lds[NBUF * NC];
@@ -312,7 +320,9 @@ __global__ void attend_ker_d512(const attn_globals g) {
             transpose(q_tc, q_bf);
             mma_AtB(att, k_t, q_tc, att);
 #else
+#ifndef DEBUG_NOQK_MMA   // timing probe: K read from LDS and transposed, no QK MFMA
             mma_AtB(att, k_t, q_t[c], att);
+#endif
 #endif
         }
 #ifdef Q_STREAM
@@ -351,27 +361,60 @@ __global__ void attend_ker_d512(const attn_globals g) {
 #endif
         // online softmax (per query = per column of S^T)
         col_max(max_vec, att, max_prev);
+#ifdef LAZY_RESCALE
+        // Lazy rescale (FlashAttention-4 style): keep the stale running max unless some query's max grew by more than
+        // 2^RESCALE_LOG2 (log2 domain). P = exp2(S - stale max) is then at most 2^RESCALE_LOG2, safe in bf16 / fp32, and
+        // the result stays exact because O and the row sum share the same reference max. The decision is warp-uniform,
+        // so most KV tiles skip the 256-register rescale of O entirely.
+#ifndef RESCALE_LOG2
+#define RESCALE_LOG2 8.0f
+#endif
+        bool grow = false;
+        {
+            const float* mv = reinterpret_cast<const float*>(&max_vec.data[0][0]);
+            const float* mp = reinterpret_cast<const float*>(&max_prev.data[0][0]);
+            #pragma unroll
+            for (int e = 0; e < (int)(sizeof(max_vec.data) / sizeof(float)); e++) grow |= (mv[e] - mp[e]) > RESCALE_LOG2;
+        }
+        const bool rescale = __builtin_amdgcn_ballot_w64(grow) != 0;
+        if (rescale) {
+            sub(scale_vec, max_prev, max_vec);
+            exp2(scale_vec, scale_vec);
+            mul(norm_vec, norm_vec, scale_vec);
+            copy(max_prev, max_vec);
+            #pragma unroll
+            for (int c = 0; c < NC; c++) mul_col(o[c], o[c], scale_vec);
+        }
+        sub_col(att, att, max_prev);
+#else
         sub(scale_vec, max_prev, max_vec);
         exp2(scale_vec, scale_vec);
         sub_col(att, att, max_vec);
+        mul(norm_vec, norm_vec, scale_vec);
+        copy(max_prev, max_vec);
+#endif
         #pragma unroll
         for (int ti = 0; ti < att.height; ti++)
             #pragma unroll
             for (int tj = 0; tj < att.width; tj++) exp2(att.tiles[ti][tj], att.tiles[ti][tj]);
-        mul(norm_vec, norm_vec, scale_vec);
         col_sum(norm_vec, att, norm_vec);
-        copy(max_prev, max_vec);
         copy(att_bf16, att);
         att_in = *reinterpret_cast<attn_tile<bf16, col_l, rt_16x32_4_s>*>(&att_bf16);
 
         // O_c^T = O_c^T * scale + V_c^T P^T
         #pragma unroll
         for (int c = 0; c < NC; c++) {
+#if !defined(DEBUG_NORESCALE) && !defined(LAZY_RESCALE)
             mul_col(o[c], o[c], scale_vec);
+#endif
+#ifndef DEBUG_NOPV   // timing probe: no V LDS read, no PV MFMA
             kv_tile<bf16, col_l, rt_16x32_4_s> v_reg;
             load(v_reg, v_smem[cur + c]);
             __builtin_amdgcn_sched_barrier(0); asm volatile("s_waitcnt lgkmcnt(0)"); __builtin_amdgcn_sched_barrier(0);
+#ifndef DEBUG_NOPV_MMA   // timing probe: V read from LDS, no PV MFMA
             mma_AtB(o[c], v_reg, att_in, o[c]);
+#endif
+#endif
         }
     }
 
