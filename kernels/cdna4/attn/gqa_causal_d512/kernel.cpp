@@ -118,7 +118,7 @@ struct attn_globals {
     // prefix + extend: queries are positions q_off .. q_off + n_q - 1 of a sequence whose K/V hold n_kv rows
     // (n_kv = q_off + n_q for one extend chunk over a cached prefix; q_off = 0, n_kv = n_q is plain causal attention)
     int q_off, n_q, n_kv;
-    hipStream_t stream;
+    uint64_t stream_ptr;   // torch.cuda.current_stream().cuda_stream (0 = null stream)
     dim3 grid() { return dim3(ATTN_H, ((n_q + Q_BLOCK_SIZE - 1) / Q_BLOCK_SIZE + NUM_WARPS - 1) / NUM_WARPS, ATTN_B); }
     dim3 block() { return dim3(NUM_THREADS); }
     size_t dynamic_shared_memory() { return MAX_SHARED_MEMORY; }
@@ -393,13 +393,13 @@ __global__ void attend_ker_d512(const attn_globals g) {
 void dispatch_d512(attn_globals g) {
     unsigned long mem_size = g.dynamic_shared_memory();
     hipFuncSetAttribute((void*)attend_ker_d512, hipFuncAttributeMaxDynamicSharedMemorySize, mem_size);
-    attend_ker_d512<<<g.grid(), g.block(), mem_size, g.stream>>>(g);
+    attend_ker_d512<<<g.grid(), g.block(), mem_size, reinterpret_cast<hipStream_t>(g.stream_ptr)>>>(g);
 }
 
 PYBIND11_MODULE(tk_kernel, m) {
     m.doc() = "HipKittens GQA causal attention, head_dim 512 (v0)";
-    // dispatch_d512(q (B,n_q,H,D), k (B,n_kv,H_KV,D), v, o (B,n_q,H,D), lse (B,H,1,n_q), q_off, n_q, n_kv)
+    // dispatch_d512(q (B,n_q,H,D), k (B,n_kv,H_KV,D), v, o (B,n_q,H,D), lse (B,H,1,n_q), q_off, n_q, n_kv, stream)
     py::bind_function<dispatch_d512>(m, "dispatch_d512",
         &attn_globals::Qg, &attn_globals::Kg, &attn_globals::Vg, &attn_globals::Og, &attn_globals::L_vec,
-        &attn_globals::q_off, &attn_globals::n_q, &attn_globals::n_kv);
+        &attn_globals::q_off, &attn_globals::n_q, &attn_globals::n_kv, &attn_globals::stream_ptr);
 }

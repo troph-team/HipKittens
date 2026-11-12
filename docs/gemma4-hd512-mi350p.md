@@ -108,6 +108,25 @@ So HipKittens is 1.42× Triton at equal precision (bf16 prefix). Against the ser
 variant's speed at 40× its accuracy, and beats the accurate variant by 1.11×. Feeding it from SGLang's paged FP8
 cache means gathering and upcasting the prefix to bf16 per layer, ~0.4 GB of traffic or well under 1 ms.
 
+**In SGLang** (amd-inference-eval `patches/sglang_hk_d512_extend.py`, `SGLANG_HK_D512=1`). The route gathers the paged
+FP8 prefix, upcasts it to bf16, and calls this kernel for Gemma 4's global layers. Measured on the optimized
+FP8-block stack (split K/V allocation, tuned GEMMs):
+
+| case | Triton FP8 path (hd512 tile) | Triton + precision fix | HipKittens route |
+|---|---|---|---|
+| extend 64K + 32K | 11.76 s | 12.35 s | 12.18 s |
+| cold 64K | 15.8 s | 16.2 s | 16.07 s |
+| global-layer attention vs fp32 | ~11% | 0.35% | 0.28% |
+
+Greedy output on 6 replay prompts is fluent and on-format. Per call the kernel is level with Triton's FP8 path:
+127 ms of kernel time plus 2.4 ms to gather and upcast. So the gain today is accuracy, not speed. The next step for
+speed is to read FP8 K/V from the cache directly: half the LDS and global traffic, and FP8 MFMA for P·V with scaled P.
+
+Integration bugs, both fixed:
+1. **Kernel launched on the null stream.** Now `stream_ptr` = `torch.cuda.current_stream().cuda_stream`.
+2. **The prefix length came from `kv_indptr[1].item()`.** It reads a tensor that SGLang fills asynchronously, so it
+   sometimes got a stale value and generation became garbage. Now it uses the host-known `kv_indices.numel()`.
+
 Tried and rejected: streaming Q chunks from global per KV tile (`-DQ_STREAM`). It removes all spills but is slower
 (39.8 ms), because the per-chunk waits expose latency.
 

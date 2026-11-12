@@ -18,7 +18,7 @@ def make(P, E, seed=0):
 
 def hk(q, k, v, P, E):
     o = torch.empty(1, E, H, D, device="cuda", dtype=torch.bfloat16); lse = torch.empty(1, H, 1, E, device="cuda")
-    tk_kernel.dispatch_d512(q, k, v, o, lse, P, E, P + E)
+    tk_kernel.dispatch_d512(q, k, v, o, lse, P, E, P + E, torch.cuda.current_stream().cuda_stream)
     return o
 
 
