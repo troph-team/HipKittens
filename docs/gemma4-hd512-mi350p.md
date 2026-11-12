@@ -200,3 +200,19 @@ O at 32 queries × 512 is 256 fp32 registers, so a second wave per SIMD cannot f
   layout, so LDS read traffic doesn't drop, and memory is no longer the limit.
 - **FP8 P·V.** HipKittens' FP8 register tiles cover only the 16×16×128 MFMA, which needs 128-row KV blocks and
   doesn't fit in LDS. The 32×32×64 form would need raw MFMA calls and a custom V layout.
+
+### Result: two waves per SIMD (`kernel_split.cpp`) is slower
+
+- **Built as planned:** 8 warps, pairs split head_dim, partial Sᵀ swapped through LDS. It uses the full 163,840-byte
+  LDS, against HipKittens' 160,000-byte default. Correct first time (0.29% error).
+- **Speed:** 114 ms at P = 64K, E = 8K, against 99.4 ms for v2. Occupancy is 2 waves per SIMD and 256 VGPRs, with
+  3–9 spilled.
+- **The swap is the cost.** Without it (wrong results, `-DDEBUG_NOSWAP`) the kernel runs at 91 ms, no spills.
+  128-bit LDS accesses for the swap don't change the time; the extra block-wide barrier per KV tile does. With
+  16 blocks per CU × 2304 KV tiles, that comes to about 1,500 cycles per barrier.
+- **Why it can't win:** barriers keep all 8 waves in the same phase, so the overlap the design relies on doesn't
+  happen. Even with a free swap the gain is 8%.
+- **What would be needed:** either no block-wide sync between the pair (a spin-wait on an LDS flag, which competes
+  with the partner on the same SIMD), or a software pipeline across KV tiles (P·V of tile j-1 while tile j's
+  partial S is swapped). The second needs a third K/V buffer, and LDS has no room. Not pursued; v2 stays the
+  production kernel.
