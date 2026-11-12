@@ -254,6 +254,25 @@ __global__ void attend_ker_d512(const attn_globals g) {
         if ((j + 1) * KV_BLOCK_SIZE > q_start_pos) mask_kv_tile(att, tile_idx, j, neg_inf_v, lane);
 #endif
 
+#ifdef DEBUG_PV
+        // debug: P = 1 on KV tile 0 only, no softmax -> O^T = V_0^T . 1, i.e. every query gets sum over kv rows 0..63
+        if (j == 0) {
+            zero(att); add(att, att, 1.0f);
+            copy(att_bf16, att);
+            att_in = *reinterpret_cast<attn_tile<bf16, col_l, rt_16x32_4_s>*>(&att_bf16);
+            #pragma unroll
+            for (int c = 0; c < NC; c++) {
+                kv_tile<bf16, col_l, rt_16x32_4_s> v_reg;
+                load(v_reg, v_smem[c]);
+                asm volatile("s_waitcnt lgkmcnt(0)");
+                mma_AtB(o[c], v_reg, att_in, o[c]);
+                qo_tile<float, row_l, rt_32x32_s> o_row;
+                transpose(o_row, o[c]);
+                store<1>(g.Og, o_row, {batch_idx, tile_idx, head_idx, c});
+            }
+            return;
+        }
+#endif
         // online softmax (per query = per column of S^T)
         col_max(max_vec, att, max_prev);
         sub(scale_vec, max_prev, max_vec);
