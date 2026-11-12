@@ -70,3 +70,28 @@ The budget is 512 VGPRs + AGPRs per lane at one wave per SIMD. Double-buffered K
 
 Unfused attention as blocked GEMMs (hipBLASLt QKᵀ, separate softmax, PV, LSE merge) was prototyped and is 3× slower
 than the Triton kernel (390 vs 131 ms on the real call), so the port has to stay fused.
+
+## Status of `kernels/cdna4/attn/gqa_causal_d512` (v0, work in progress, not yet correct)
+
+Version 0 is a straightforward, unscheduled kernel. Per 128-wide D chunk it uses the D=128 kernel's tile types:
+S^T = Σ_c K_c^T·Q_c^T, O_c^T += V_c·P^T. K and V are held as 4 separate 64×128 shared tiles each.
+
+Verified so far (MI350P, N = 2048, 32 q / 4 kv heads):
+- **Debug harness.** The original D=128 kernel scores 0.2–0.3% error in `debug_d512.py`.
+- **Q path.** Global → registers → scaled round-trips exactly (`DEBUG_Q`, 1.6e-3 = bf16 output rounding).
+- **K staging with 8 warps.** HipKittens direct-to-LDS (`G::load<1,false>(st, gl, coord, swz, srsrc, base, lds)`) puts
+  K in LDS bit-exactly (`DEBUG_K`).
+
+Problems found:
+1. **`G::load(st, gl, coord)` defaults to axis 2.** For (B, N, H, D) tensors the sequence axis is 1, so pass `<1, false>`.
+2. **Direct-to-LDS staging is only correct with 8 warps per block.** The original kernel breaks with 4 warps too.
+   - D=512 needs 4 warps (one wave per SIMD, 512 VGPR+AGPR). With 8 warps it spills 759 VGPRs.
+   - Next experiment: register-staged `G::load<1,false>(st, gl, coord)` at 4 warps (`#ifndef DIRECT_LDS` path).
+3. **`-ffast-math` implies finite-math-only.** The online-softmax running max can't start at -inf (it now starts at
+   -1e30).
+4. **Still NaN at D=128 with 8 warps and the -1e30 fix.** With masking disabled (`DEBUG_NOMASK`), warps that process a
+   single KV tile are NaN and the others are off by 0.2–6.7, so the error is in the softmax / PV path, not in masking.
+   Next: round-trip V the same way as K, then the P·V product on a known P.
+
+At N = 2048 the spilling v0 (4 warps, wrong output) already runs at about Triton's speed (213 vs 202 TFLOP/s), so
+the target of about 2× after spills and scheduling are fixed looks plausible.

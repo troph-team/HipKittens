@@ -1,0 +1,22 @@
+GPU_TARGET ?= CDNA4
+TARGET ?= tk_kernel
+PYTHON ?= python3
+
+ATTN_B ?= 1
+ATTN_H ?= 32
+ATTN_H_KV ?= 4
+ATTN_N ?= 4096
+ATTN_D ?= 512
+NUM_WARPS ?= 4
+
+CPPFLAGS += -DATTN_B=$(ATTN_B)
+CPPFLAGS += -DATTN_H=$(ATTN_H)
+CPPFLAGS += -DATTN_H_KV=$(ATTN_H_KV)
+CPPFLAGS += -DATTN_N=$(ATTN_N)
+CPPFLAGS += -DATTN_D=$(ATTN_D)
+CPPFLAGS += -DNUM_WARPS=$(NUM_WARPS)
+
+SRC ?= kernel.cpp
+EXTRA_HIPFLAGS += -DHIP_ENABLE_WARP_SYNC_BUILTINS -ffast-math
+
+include ../../../common.mk
