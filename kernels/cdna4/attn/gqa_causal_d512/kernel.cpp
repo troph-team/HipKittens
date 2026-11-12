@@ -132,6 +132,12 @@ __global__ void attend_ker_d512(const attn_globals g) {
     const int block_tile_idx = blockIdx.y;
     const int tile_idx = block_tile_idx * NUM_WARPS + warpid();   // this warp's 32-query tile
     const int lane = laneid();
+#ifdef DEBUG_ADDR
+    if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0)
+        printf("[addr] k0 %u k_end %u v0 %u sizeof(st_k) %u sizeof(st_v) %u\n", (unsigned)(uintptr_t)&k_smem[0].data[0],
+               (unsigned)(uintptr_t)&k_smem[NC - 1].data[0] + (unsigned)sizeof(k_smem[0]), (unsigned)(uintptr_t)&v_smem[0].data[0],
+               (unsigned)sizeof(k_smem[0]), (unsigned)sizeof(v_smem[0]));
+#endif
     const int q_start_pos = tile_idx * Q_BLOCK_SIZE;
     const bool warp_active = q_start_pos < ATTN_N;
     const uint32_t neg_inf_v = 0xff800000;
@@ -201,27 +207,42 @@ __global__ void attend_ker_d512(const attn_globals g) {
 
     for (int j = 0; j < num_kv_tiles; j++) {
         // all warps cooperatively stage K_j and V_j (64 x 512 bf16 each) into LDS
-        __builtin_amdgcn_s_barrier();
+        __builtin_amdgcn_sched_barrier(0); __builtin_amdgcn_s_barrier(); __builtin_amdgcn_sched_barrier(0);
         #pragma unroll
         for (int c = 0; c < NC; c++) {
 #ifdef DIRECT_LDS   // HipKittens direct-to-LDS staging: only correct with 8 warps per block
             G::load<1, false>(k_smem[c], g.Kg, {batch_idx, j, head_idx_kv, c}, swz_K, k_srsrc, k_base, k_lds[c]);
             G::load<1, false>(v_smem[c], g.Vg, {batch_idx, j, head_idx_kv, c}, swz_V, v_srsrc, v_base, v_lds[c]);
 #else               // register-staged (global -> VGPR -> ds_write), works for any warp count
+#ifndef DEBUG_NO_K
             G::load<1, false>(k_smem[c], g.Kg, {batch_idx, j, head_idx_kv, c});
+#endif
             G::load<1, false>(v_smem[c], g.Vg, {batch_idx, j, head_idx_kv, c});
 #endif
         }
-        asm volatile("s_waitcnt vmcnt(0)");
-        asm volatile("s_waitcnt lgkmcnt(0)");   // G::load may stage through registers + ds_write
-        __builtin_amdgcn_s_barrier();
+        __builtin_amdgcn_sched_barrier(0); asm volatile("s_waitcnt vmcnt(0)"); __builtin_amdgcn_sched_barrier(0);
+        __builtin_amdgcn_sched_barrier(0); asm volatile("s_waitcnt lgkmcnt(0)"); __builtin_amdgcn_sched_barrier(0);   // G::load may stage through registers + ds_write
+        __builtin_amdgcn_sched_barrier(0); __builtin_amdgcn_s_barrier(); __builtin_amdgcn_sched_barrier(0);
 
+#ifdef DEBUG_V
+        if (j == 0) {   // debug: V tile 0 chunk c=warp via LDS -> row-layout registers -> Og[b, 0:64, head, 128*warp : +128]
+            if (warpid() < NC) {
+                kv_tile<bf16> v_dbg;
+                load(v_dbg, v_smem[warpid()]);
+                __builtin_amdgcn_sched_barrier(0); asm volatile("s_waitcnt lgkmcnt(0)"); __builtin_amdgcn_sched_barrier(0);
+                kv_tile<float> v_dbg_f;
+                copy(v_dbg_f, v_dbg);
+                store<1>(g.Og, v_dbg_f, {batch_idx, 0, head_idx, warpid()});
+            }
+            return;
+        }
+#endif
 #ifdef DEBUG_K
         if (j == 0) {   // debug: K tile 0 chunk c=warp, via LDS -> registers -> Og[b, 0:64, head, 128*warp : +128]
             if (warpid() < NC) {
                 kv_tile<bf16> k_dbg;
                 load(k_dbg, k_smem[warpid()]);
-                asm volatile("s_waitcnt lgkmcnt(0)");
+                __builtin_amdgcn_sched_barrier(0); asm volatile("s_waitcnt lgkmcnt(0)"); __builtin_amdgcn_sched_barrier(0);
                 kv_tile<float> k_dbg_f;
                 copy(k_dbg_f, k_dbg);
                 store<1>(g.Og, k_dbg_f, {batch_idx, 0, head_idx, warpid()});
@@ -237,7 +258,7 @@ __global__ void attend_ker_d512(const attn_globals g) {
         for (int c = 0; c < NC; c++) {
             kv_tile<bf16> k_reg;
             load(k_reg, k_smem[c]);
-            asm volatile("s_waitcnt lgkmcnt(0)");
+            __builtin_amdgcn_sched_barrier(0); asm volatile("s_waitcnt lgkmcnt(0)"); __builtin_amdgcn_sched_barrier(0);
             kv_tile_transposed<bf16> k_t;
             transpose(k_t, k_reg);
             mma_AtB(att, k_t, q_t[c], att);
@@ -264,7 +285,7 @@ __global__ void attend_ker_d512(const attn_globals g) {
             for (int c = 0; c < NC; c++) {
                 kv_tile<bf16, col_l, rt_16x32_4_s> v_reg;
                 load(v_reg, v_smem[c]);
-                asm volatile("s_waitcnt lgkmcnt(0)");
+                __builtin_amdgcn_sched_barrier(0); asm volatile("s_waitcnt lgkmcnt(0)"); __builtin_amdgcn_sched_barrier(0);
                 mma_AtB(o[c], v_reg, att_in, o[c]);
                 qo_tile<float, row_l, rt_32x32_s> o_row;
                 transpose(o_row, o[c]);
@@ -294,7 +315,7 @@ __global__ void attend_ker_d512(const attn_globals g) {
             mul_col(o[c], o[c], scale_vec);
             kv_tile<bf16, col_l, rt_16x32_4_s> v_reg;
             load(v_reg, v_smem[c]);
-            asm volatile("s_waitcnt lgkmcnt(0)");
+            __builtin_amdgcn_sched_barrier(0); asm volatile("s_waitcnt lgkmcnt(0)"); __builtin_amdgcn_sched_barrier(0);
             mma_AtB(o[c], v_reg, att_in, o[c]);
         }
     }

@@ -71,27 +71,30 @@ The budget is 512 VGPRs + AGPRs per lane at one wave per SIMD. Double-buffered K
 Unfused attention as blocked GEMMs (hipBLASLt QKᵀ, separate softmax, PV, LSE merge) was prototyped and is 3× slower
 than the Triton kernel (390 vs 131 ms on the real call), so the port has to stay fused.
 
-## Status of `kernels/cdna4/attn/gqa_causal_d512` (v0, work in progress, not yet correct)
+## Status of `kernels/cdna4/attn/gqa_causal_d512` (v0: correct, 1.05× Triton, unoptimized)
 
-Version 0 is a straightforward, unscheduled kernel. Per 128-wide D chunk it uses the D=128 kernel's tile types:
-S^T = Σ_c K_c^T·Q_c^T, O_c^T += V_c·P^T. K and V are held as 4 separate 64×128 shared tiles each.
+v0 is a straightforward kernel with no double buffering and no hand scheduling. Per 128-wide D chunk it reuses the
+D=128 kernel's tile types: S^T = Σ_c K_c^T·Q_c^T and O_c^T += V_c·P^T, with K and V held as 4 separate 64×128 shared
+tiles each. It runs 4 warps per block and stages K/V through registers.
 
-Verified so far (MI350P, N = 2048, 32 q / 4 kv heads):
-- **Debug harness.** The original D=128 kernel scores 0.2–0.3% error in `debug_d512.py`.
-- **Q path.** Global → registers → scaled round-trips exactly (`DEBUG_Q`, 1.6e-3 = bf16 output rounding).
-- **K staging with 8 warps.** HipKittens direct-to-LDS (`G::load<1,false>(st, gl, coord, swz, srsrc, base, lds)`) puts
-  K in LDS bit-exactly (`DEBUG_K`).
+| N (1 seq, 32 q / 4 kv heads, causal) | HipKittens d512 v0 | SGLang Triton d512 | rel err vs fp32 |
+|---|---|---|---|
+| 2048 | 0.67 ms, 206 TFLOP/s | 0.68 ms, 202 TFLOP/s | 2.5e-3 |
+| 16384 | 29.1 ms, 302 TFLOP/s | 30.6 ms, 288 TFLOP/s | 2.6e-3 |
 
-Problems found:
-1. **`G::load(st, gl, coord)` defaults to axis 2.** For (B, N, H, D) tensors the sequence axis is 1, so pass `<1, false>`.
-2. **Direct-to-LDS staging is only correct with 8 warps per block.** The original kernel breaks with 4 warps too.
-   - D=512 needs 4 warps (one wave per SIMD, 512 VGPR+AGPR). With 8 warps it spills 759 VGPRs.
-   - Next experiment: register-staged `G::load<1,false>(st, gl, coord)` at 4 warps (`#ifndef DIRECT_LDS` path).
-3. **`-ffast-math` implies finite-math-only.** The online-softmax running max can't start at -inf (it now starts at
-   -1e30).
-4. **Still NaN at D=128 with 8 warps and the -1e30 fix.** With masking disabled (`DEBUG_NOMASK`), warps that process a
-   single KV tile are NaN and the others are off by 0.2–6.7, so the error is in the softmax / PV path, not in masking.
-   Next: round-trip V the same way as K, then the P·V product on a known P.
+The same kernel built at D=128 matches the original `gqa_causal` (0.2–0.3% error).
 
-At N = 2048 the spilling v0 (4 warps, wrong output) already runs at about Triton's speed (213 vs 202 TFLOP/s), so
-the target of about 2× after spills and scheduling are fixed looks plausible.
+Bugs found on the way:
+1. **`G::load(st, gl, coord)` defaults to axis 2.** For (B, N, H, D) tensors pass `<1, false>`.
+2. **The direct-to-LDS `G::load` (swizzled offsets + srsrc) is only correct with 8 warps per block.** The original
+   kernel breaks with 4 warps too. The register-staged `G::load<1,false>(st, gl, coord)` works with 4 warps.
+3. **Fence every manual `s_waitcnt` with `__builtin_amdgcn_sched_barrier(0)`.** This was the NaN/garbage bug.
+   HipKittens' shared→register loads are inline-asm `ds_read`s the compiler doesn't track, so without the fence it
+   hoists consumers (e.g. the K transpose) above `s_waitcnt lgkmcnt(0)` and reads registers before the data lands.
+   Late data (KV rows 32–63) came out wrong.
+4. **`-ffast-math` is finite-math-only,** so the running max starts at -1e30, not -inf.
+5. **Debug probes that don't work:** P = 1 via `zero` + `add(tile, 1.0f)` doesn't give a usable all-ones P (the
+   original kernel fails the same probe), and storing an S^T tile shows store artifacts on some tiles in both kernels.
+
+Next: remove the 126 spilled VGPRs (e.g. stream Q chunks instead of holding all 4 in registers), double-buffer K/V,
+then interleave MFMA with softmax as `gqa_causal` does. After that, a prefix + extend entry point for SGLang.
