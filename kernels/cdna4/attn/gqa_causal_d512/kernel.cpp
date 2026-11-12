@@ -29,7 +29,10 @@ constexpr int ATTN_D = 512;
 
 constexpr int GROUP_SIZE = ATTN_H / ATTN_H_KV;
 constexpr int Q_BLOCK_SIZE = 32;
-constexpr int KV_BLOCK_SIZE = 64;
+#ifndef KV_BLOCK
+#define KV_BLOCK 64
+#endif
+constexpr int KV_BLOCK_SIZE = KV_BLOCK;
 constexpr int DC = 128;              // head_dim chunk
 constexpr int NC = ATTN_D / DC;      // number of chunks
 static_assert(ATTN_D % DC == 0, "head_dim must be a multiple of 128");
@@ -123,8 +126,13 @@ __global__ void attend_ker_d512(const attn_globals g) {
     extern __shared__ alignment_dummy __shm[];
     shared_allocator al((int*)&__shm[0]);
     // K and V tiles as NC separate 64 x 128 shared tiles (the exact tile types gqa_causal uses at D = 128), 128 KB total
-    st_bf<KV_BLOCK_SIZE, DC, st_32x32_s> (&k_smem)[NC] = al.allocate<st_bf<KV_BLOCK_SIZE, DC, st_32x32_s>, NC>();
-    st_bf<KV_BLOCK_SIZE, DC, st_8x32_s> (&v_smem)[NC] = al.allocate<st_bf<KV_BLOCK_SIZE, DC, st_8x32_s>, NC>();
+#ifdef DOUBLE_BUF   // two K/V buffers (needs DIRECT_LDS: async loads); index [buf * NC + chunk]
+    constexpr int NBUF = 2;
+#else
+    constexpr int NBUF = 1;
+#endif
+    st_bf<KV_BLOCK_SIZE, DC, st_32x32_s> (&k_smem)[NBUF * NC] = al.allocate<st_bf<KV_BLOCK_SIZE, DC, st_32x32_s>, NBUF * NC>();
+    st_bf<KV_BLOCK_SIZE, DC, st_8x32_s> (&v_smem)[NBUF * NC] = al.allocate<st_bf<KV_BLOCK_SIZE, DC, st_8x32_s>, NBUF * NC>();
 
     const int head_idx = (blockIdx.x % ATTN_H_KV) * GROUP_SIZE + (blockIdx.x / ATTN_H_KV);
     const int batch_idx = blockIdx.z;
@@ -151,9 +159,9 @@ __global__ void attend_ker_d512(const attn_globals g) {
     i32x4 v_srsrc = make_srsrc(v_base, v_row_stride * ATTN_N, v_row_stride);
     const int wid = warpid() % NUM_WARPS;
     constexpr int elem_per_warp = (16 / sizeof(bf16)) * kittens::WARP_THREADS;
-    uint32_t k_lds[NC], v_lds[NC];
+    uint32_t k_lds[NBUF * NC], v_lds[NBUF * NC];
     #pragma unroll
-    for (int c = 0; c < NC; c++) {
+    for (int c = 0; c < NBUF * NC; c++) {
         k_lds[c] = __builtin_amdgcn_readfirstlane(static_cast<uint32_t>(
             reinterpret_cast<uintptr_t>(&k_smem[c].data[0]) + wid * elem_per_warp * sizeof(bf16)));
         v_lds[c] = __builtin_amdgcn_readfirstlane(static_cast<uint32_t>(
@@ -173,6 +181,7 @@ __global__ void attend_ker_d512(const attn_globals g) {
     const int my_kv_tiles = (q_start_pos + Q_BLOCK_SIZE + KV_BLOCK_SIZE - 1) / KV_BLOCK_SIZE;
 
     // ---- Q: 4 chunks of 32 x 128, pre-scaled by softmax_scale * log2(e), kept transposed in registers ----
+#ifndef Q_STREAM
     qo_tile_transposed<bf16> q_t[NC];
     if (warp_active) {
         #pragma unroll
@@ -189,6 +198,7 @@ __global__ void attend_ker_d512(const attn_globals g) {
             transpose(q_t[c], q_bf);
         }
     }
+#endif
 
 #ifdef DEBUG_Q
     return;
@@ -205,8 +215,36 @@ __global__ void attend_ker_d512(const attn_globals g) {
     add(max_prev, max_prev, -1.0e30f);
     zero(norm_vec);
 
+#ifdef DOUBLE_BUF
+    constexpr int LOADS_PER_TILE = 2 * NC * memcpy_per_tile;   // buffer_load_lds instructions per K+V tile (vmcnt units)
+    static_assert(LOADS_PER_TILE <= 63, "vmcnt field is 6 bits");
+    #pragma unroll
+    for (int c = 0; c < NC; c++) {   // prologue: KV tile 0 -> buffer 0
+        G::load<1, false>(k_smem[c], g.Kg, {batch_idx, 0, head_idx_kv, c}, swz_K, k_srsrc, k_base, k_lds[c]);
+        G::load<1, false>(v_smem[c], g.Vg, {batch_idx, 0, head_idx_kv, c}, swz_V, v_srsrc, v_base, v_lds[c]);
+    }
+#endif
     for (int j = 0; j < num_kv_tiles; j++) {
-        // all warps cooperatively stage K_j and V_j (64 x 512 bf16 each) into LDS
+#ifdef DOUBLE_BUF
+        const int cur = (j & 1) * NC;
+        // everyone is done with tile j-1, whose buffer tile j+1 now overwrites
+        __builtin_amdgcn_sched_barrier(0); __builtin_amdgcn_s_barrier(); __builtin_amdgcn_sched_barrier(0);
+        if (j + 1 < num_kv_tiles) {
+            const int nxt = ((j + 1) & 1) * NC;
+            #pragma unroll
+            for (int c = 0; c < NC; c++) {
+                G::load<1, false>(k_smem[nxt + c], g.Kg, {batch_idx, j + 1, head_idx_kv, c}, swz_K, k_srsrc, k_base, k_lds[nxt + c]);
+                G::load<1, false>(v_smem[nxt + c], g.Vg, {batch_idx, j + 1, head_idx_kv, c}, swz_V, v_srsrc, v_base, v_lds[nxt + c]);
+            }
+            // wait for tile j only; tile j+1's LOADS_PER_TILE loads stay in flight
+            __builtin_amdgcn_sched_barrier(0); asm volatile("s_waitcnt vmcnt(%0)" :: "n"(LOADS_PER_TILE)); __builtin_amdgcn_sched_barrier(0);
+        } else {
+            __builtin_amdgcn_sched_barrier(0); asm volatile("s_waitcnt vmcnt(0)"); __builtin_amdgcn_sched_barrier(0);
+        }
+        __builtin_amdgcn_sched_barrier(0); __builtin_amdgcn_s_barrier(); __builtin_amdgcn_sched_barrier(0);
+#else
+        constexpr int cur = 0;
+        // all warps cooperatively stage K_j and V_j into LDS
         __builtin_amdgcn_sched_barrier(0); __builtin_amdgcn_s_barrier(); __builtin_amdgcn_sched_barrier(0);
         #pragma unroll
         for (int c = 0; c < NC; c++) {
@@ -223,6 +261,7 @@ __global__ void attend_ker_d512(const attn_globals g) {
         __builtin_amdgcn_sched_barrier(0); asm volatile("s_waitcnt vmcnt(0)"); __builtin_amdgcn_sched_barrier(0);
         __builtin_amdgcn_sched_barrier(0); asm volatile("s_waitcnt lgkmcnt(0)"); __builtin_amdgcn_sched_barrier(0);   // G::load may stage through registers + ds_write
         __builtin_amdgcn_sched_barrier(0); __builtin_amdgcn_s_barrier(); __builtin_amdgcn_sched_barrier(0);
+#endif
 
 #ifdef DEBUG_V
         if (j == 0) {   // debug: V tile 0 chunk c=warp via LDS -> row-layout registers -> Og[b, 0:64, head, 128*warp : +128]
@@ -257,12 +296,24 @@ __global__ void attend_ker_d512(const attn_globals g) {
         #pragma unroll
         for (int c = 0; c < NC; c++) {
             kv_tile<bf16> k_reg;
-            load(k_reg, k_smem[c]);
+            load(k_reg, k_smem[cur + c]);
             __builtin_amdgcn_sched_barrier(0); asm volatile("s_waitcnt lgkmcnt(0)"); __builtin_amdgcn_sched_barrier(0);
             kv_tile_transposed<bf16> k_t;
             transpose(k_t, k_reg);
+#ifdef Q_STREAM   // Q chunk re-read from global (L1/L2) per KV tile: frees 128 VGPRs, scale applied to S below
+            qo_tile<bf16> q_bf;
+            load<1, qo_tile<bf16>, _gl_QKVO>(q_bf, g.Qg, {batch_idx, tile_idx, head_idx, c});
+            __builtin_amdgcn_sched_barrier(0); asm volatile("s_waitcnt vmcnt(0)"); __builtin_amdgcn_sched_barrier(0);
+            qo_tile_transposed<bf16> q_tc;
+            transpose(q_tc, q_bf);
+            mma_AtB(att, k_t, q_tc, att);
+#else
             mma_AtB(att, k_t, q_t[c], att);
+#endif
         }
+#ifdef Q_STREAM
+        mul(att, att, ATTN_SCALE * 1.44269504089f);
+#endif
 #ifdef DEBUG_S
         if (j == 0) {   // debug: S (32 q x 64 kv) of KV tile 0, row layout -> Og[b, 32*tile : +32, head, 0:64]
             rt<float, Q_BLOCK_SIZE, KV_BLOCK_SIZE, row_l, rt_32x32_s> s_row;
@@ -284,7 +335,7 @@ __global__ void attend_ker_d512(const attn_globals g) {
             #pragma unroll
             for (int c = 0; c < NC; c++) {
                 kv_tile<bf16, col_l, rt_16x32_4_s> v_reg;
-                load(v_reg, v_smem[c]);
+                load(v_reg, v_smem[cur + c]);
                 __builtin_amdgcn_sched_barrier(0); asm volatile("s_waitcnt lgkmcnt(0)"); __builtin_amdgcn_sched_barrier(0);
                 mma_AtB(o[c], v_reg, att_in, o[c]);
                 qo_tile<float, row_l, rt_32x32_s> o_row;
@@ -314,7 +365,7 @@ __global__ void attend_ker_d512(const attn_globals g) {
         for (int c = 0; c < NC; c++) {
             mul_col(o[c], o[c], scale_vec);
             kv_tile<bf16, col_l, rt_16x32_4_s> v_reg;
-            load(v_reg, v_smem[c]);
+            load(v_reg, v_smem[cur + c]);
             __builtin_amdgcn_sched_barrier(0); asm volatile("s_waitcnt lgkmcnt(0)"); __builtin_amdgcn_sched_barrier(0);
             mma_AtB(o[c], v_reg, att_in, o[c]);
         }

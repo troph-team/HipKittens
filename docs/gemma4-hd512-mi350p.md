@@ -71,7 +71,7 @@ The budget is 512 VGPRs + AGPRs per lane at one wave per SIMD. Double-buffered K
 Unfused attention as blocked GEMMs (hipBLASLt QKᵀ, separate softmax, PV, LSE merge) was prototyped and is 3× slower
 than the Triton kernel (390 vs 131 ms on the real call), so the port has to stay fused.
 
-## Status of `kernels/cdna4/attn/gqa_causal_d512` (v0: correct, 1.05× Triton, unoptimized)
+## Status of `kernels/cdna4/attn/gqa_causal_d512` (correct; 1.14× SGLang Triton at N = 16K)
 
 v0 is a straightforward kernel with no double buffering and no hand scheduling. Per 128-wide D chunk it reuses the
 D=128 kernel's tile types: S^T = Σ_c K_c^T·Q_c^T and O_c^T += V_c·P^T, with K and V held as 4 separate 64×128 shared
@@ -84,10 +84,21 @@ tiles each. It runs 4 warps per block and stages K/V through registers.
 
 The same kernel built at D=128 matches the original `gqa_causal` (0.2–0.3% error).
 
+Optimizations so far (D=512, N=16384; build flags in parentheses):
+
+| version | spill | time | TFLOP/s | vs Triton (30.6 ms) |
+|---|---|---|---|---|
+| v0: KV block 64, register-staged | 126 VGPR | 29.1 ms | 302 | 1.05× |
+| KV block 32 (`-DKV_BLOCK=32`) | 10 | 27.8 ms | 316 | 1.10× |
+| + direct-to-LDS, double-buffered K/V (`-DDIRECT_LDS -DDOUBLE_BUF -DKV_BLOCK=32`) | 15 | 26.8 ms | 329 | 1.14× |
+
+Tried and rejected: streaming Q chunks from global per KV tile (`-DQ_STREAM`). It removes all spills but is slower
+(39.8 ms), because the per-chunk waits expose latency.
+
 Bugs found on the way:
 1. **`G::load(st, gl, coord)` defaults to axis 2.** For (B, N, H, D) tensors pass `<1, false>`.
-2. **The direct-to-LDS `G::load` (swizzled offsets + srsrc) is only correct with 8 warps per block.** The original
-   kernel breaks with 4 warps too. The register-staged `G::load<1,false>(st, gl, coord)` works with 4 warps.
+2. **The direct-to-LDS `G::load` (swizzled offsets + srsrc) looked broken at 4 warps, but wasn't.** It was the same
+   bug as 3. With the fences it is exact at 4 warps.
 3. **Fence every manual `s_waitcnt` with `__builtin_amdgcn_sched_barrier(0)`.** This was the NaN/garbage bug.
    HipKittens' shared→register loads are inline-asm `ds_read`s the compiler doesn't track, so without the fence it
    hoists consumers (e.g. the K transpose) above `s_waitcnt lgkmcnt(0)` and reads registers before the data lands.
